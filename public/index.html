@@ -301,9 +301,16 @@ function App(){
   const ref = useRef(null);
 
   // Fetch colleges from API
-  useEffect(() => {
-    fetchColleges();
-  }, []);
+useEffect(() => {
+  if (search.length < 3) {
+    fetchColleges(); // homepage / popular
+  } else {
+    fetch(`/api/colleges?q=${encodeURIComponent(search)}`)
+      .then(res => res.json())
+      .then(data => setColleges(data.results || []));
+  }
+}, [search]);
+
 
   const fetchColleges = async () => {
     try {
@@ -556,4 +563,5 @@ function App(){
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
 </script>
 </body>
+
 </html>
