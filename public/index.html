@@ -29,12 +29,20 @@
   .search-wrap { position: relative; margin-bottom: 16px; }
   .search-wrap .icon { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); color: #555; font-size: 18px; pointer-events: none; }
   .search-wrap input {
-    width: 100%; padding: 12px 16px 12px 40px;
+    width: 100%; padding: 12px 40px 12px 40px;
     background: #1a1a2e; border: 1px solid #2a2a4a; border-radius: 10px;
     color: #fff; font-size: 14px; outline: none; transition: border-color .2s;
   }
   .search-wrap input:focus { border-color: #8ab4e8; }
   .search-wrap input::placeholder { color: #4a4a5a; }
+  .search-wrap .searching {
+    position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+  }
+  .search-wrap .mini-spinner {
+    width: 16px; height: 16px; border: 2px solid #2a2a4a;
+    border-top-color: #8ab4e8; border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
 
   /* Loading & Error */
   .loading, .error-box { text-align: center; padding: 60px 20px; }
@@ -167,15 +175,9 @@
 <div id="root"></div>
 
 <script type="text/babel">
-const { useState, useEffect, useRef } = React;
+const { useState, useEffect, useRef, useCallback } = React;
 
-/* ─── IPEDS API Integration ─── */
-// College Scorecard API (includes IPEDS data)
-const API_BASE = "/api/colleges";
-const API_KEY = "...";
-
-
-// State mapping
+// State to Region mapping
 const STATE_REGIONS = {
   "MA": "Northeast", "CT": "Northeast", "NY": "Northeast", "PA": "Northeast", 
   "NJ": "Northeast", "RI": "Northeast", "NH": "Northeast", "VT": "Northeast", "ME": "Northeast",
@@ -196,6 +198,23 @@ function getRegion(state) {
 function admColor(r){ 
   if (!r) return "green";
   return r < 0.15 ? "red" : r < 0.35 ? "amber" : "green"; 
+}
+
+// Custom debounce hook
+function useDebounce(value, delay) {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedValue(value);
+    }, delay);
+
+    return () => {
+      clearTimeout(handler);
+    };
+  }, [value, delay]);
+
+  return debouncedValue;
 }
 
 /* ── Modal ── */
@@ -273,24 +292,48 @@ function Modal({college:c, onClose}){
           <span className="value">${c.tuitionOutState.toLocaleString()}</span>
         </div>
       )}
-
-      <div className="data-row">
-        <span className="label">Carnegie Classification</span>
-        <span className="value">{c.carnegieBasic || 'N/A'}</span>
-      </div>
-      
-      <div className="data-row">
-        <span className="label">Locale</span>
-        <span className="value">{c.locale || 'N/A'}</span>
-      </div>
     </div>
   </div>;
+}
+
+/* ── Transform API Data ── */
+function transformCollegeData(school, index) {
+  const ownership = school["school.ownership"] === 1 ? "Public" : 
+                   school["school.ownership"] === 2 ? "Private Nonprofit" : 
+                   school["school.ownership"] === 3 ? "Private For-Profit" : "Unknown";
+  
+  const carnegieBasic = school["school.carnegie_basic"];
+  const isResearch = carnegieBasic === 15 || carnegieBasic === 16 || carnegieBasic === 17;
+  
+  return {
+    id: school.id || index,
+    name: school["school.name"],
+    city: school["school.city"],
+    state: school["school.state"],
+    region: getRegion(school["school.state"]),
+    url: school["school.school_url"],
+    ownership: ownership,
+    type: isResearch ? `${ownership.split(' ')[0]} Research` : ownership,
+    carnegieBasic: carnegieBasic,
+    locale: school["school.locale"],
+    admissionRate: school["2022.admissions.admission_rate.overall"],
+    satAvg: school["2022.admissions.sat_scores.average.overall"],
+    actMedian: school["2022.admissions.act_scores.midpoint.cumulative"],
+    size: school["2022.student.size"],
+    avgCost: school["2022.cost.avg_net_price.overall"],
+    tuition: school["2022.cost.tuition.in_state"],
+    tuitionOutState: school["2022.cost.tuition.out_of_state"],
+    completionRate: school["2022.completion.completion_rate_4yr_150nt"],
+    retentionRate: school["2022.student.retention_rate_suppressed.four_year.full_time"],
+    earnings: school["2022.earnings.6_yrs_after_entry.median"]
+  };
 }
 
 /* ── App ── */
 function App(){
   const [colleges, setColleges] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [searching, setSearching] = useState(false);
   const [error, setError] = useState(null);
   const [search, setSearch] = useState("");
   const [region, setRegion] = useState("All Regions");
@@ -298,107 +341,74 @@ function App(){
   const [sortBy, setSortBy] = useState("name");
   const [view, setView] = useState("grid");
   const [sel, setSel] = useState(null);
-  const ref = useRef(null);
+  const searchRef = useRef(null);
 
-  // Fetch colleges from API
-useEffect(() => {
-  if (search.length < 3) {
-    fetchColleges(); // homepage / popular
-  } else {
-    fetch(`/api/colleges?q=${encodeURIComponent(search)}`)
-      .then(res => res.json())
-      .then(data => setColleges(data.results || []));
-  }
-}, [search]);
+  // Debounce search with 500ms delay
+  const debouncedSearch = useDebounce(search, 500);
 
-
-  const fetchColleges = async () => {
+  // Fetch colleges function
+  const fetchColleges = useCallback(async (searchQuery = "") => {
     try {
-      setLoading(true);
+      // Show appropriate loading state
+      if (searchQuery && searchQuery.length >= 3) {
+        setSearching(true);
+      } else if (!searchQuery) {
+        setLoading(true);
+      }
       setError(null);
-      
-      // Fetch top schools with good data quality
-      // We'll get schools with admission rates, costs, and earnings data
-      const response = await fetch(
-        `${API_BASE}?api_key=${API_KEY}` +
-        `&school.degrees_awarded.predominant=3` + // Bachelor's degree granting
-        `&2022.admissions.admission_rate.overall__range=0..1` + // Has admission rate
-        `&2022.student.size__range=1000..` + // At least 1000 students
-        `&fields=id,school.name,school.city,school.state,school.school_url,` +
-        `school.ownership,school.carnegie_basic,school.locale,` +
-        `2022.admissions.admission_rate.overall,` +
-        `2022.admissions.sat_scores.average.overall,` +
-        `2022.admissions.act_scores.midpoint.cumulative,` +
-        `2022.student.size,` +
-        `2022.cost.avg_net_price.overall,` +
-        `2022.cost.tuition.in_state,` +
-        `2022.cost.tuition.out_of_state,` +
-        `2022.completion.completion_rate_4yr_150nt,` +
-        `2022.student.retention_rate_suppressed.four_year.full_time,` +
-        `2022.earnings.6_yrs_after_entry.median` +
-        `&per_page=100` +
-        `&sort=2022.admissions.admission_rate.overall:asc`
-      );
 
+      // Call the API endpoint
+      const url = searchQuery && searchQuery.length >= 3
+        ? `/api/colleges?q=${encodeURIComponent(searchQuery)}`
+        : '/api/colleges';
+
+      const response = await fetch(url);
+      
       if (!response.ok) {
         throw new Error(`API Error: ${response.status}`);
       }
 
       const data = await response.json();
       
-      // Transform API data to our format
-      const transformedColleges = data.results.map((school, index) => {
-        const ownership = school["school.ownership"] === 1 ? "Public" : 
-                         school["school.ownership"] === 2 ? "Private Nonprofit" : 
-                         school["school.ownership"] === 3 ? "Private For-Profit" : "Unknown";
-        
-        const carnegieBasic = school["school.carnegie_basic"];
-        const isResearch = carnegieBasic === 15 || carnegieBasic === 16 || carnegieBasic === 17;
-        
-        return {
-          id: school.id || index,
-          name: school["school.name"],
-          city: school["school.city"],
-          state: school["school.state"],
-          region: getRegion(school["school.state"]),
-          url: school["school.school_url"],
-          ownership: ownership,
-          type: isResearch ? `${ownership.split(' ')[0]} Research` : ownership,
-          carnegieBasic: carnegieBasic,
-          locale: school["school.locale"],
-          admissionRate: school["2022.admissions.admission_rate.overall"],
-          satAvg: school["2022.admissions.sat_scores.average.overall"],
-          actMedian: school["2022.admissions.act_scores.midpoint.cumulative"],
-          size: school["2022.student.size"],
-          avgCost: school["2022.cost.avg_net_price.overall"],
-          tuition: school["2022.cost.tuition.in_state"],
-          tuitionOutState: school["2022.cost.tuition.out_of_state"],
-          completionRate: school["2022.completion.completion_rate_4yr_150nt"],
-          retentionRate: school["2022.student.retention_rate_suppressed.four_year.full_time"],
-          earnings: school["2022.earnings.6_yrs_after_entry.median"]
-        };
-      });
+      // Transform the results
+      const transformedColleges = (data.results || []).map((school, index) => 
+        transformCollegeData(school, index)
+      );
 
       setColleges(transformedColleges);
       setLoading(false);
+      setSearching(false);
     } catch (err) {
       console.error("Error fetching colleges:", err);
       setError(err.message);
       setLoading(false);
+      setSearching(false);
     }
-  };
+  }, []);
 
-  // Filter and sort colleges
+  // Initial load - fetch popular/top colleges
+  useEffect(() => {
+    fetchColleges();
+  }, [fetchColleges]);
+
+  // Debounced search effect
+  useEffect(() => {
+    if (debouncedSearch !== search) return; // Only run when debounced value matches
+    
+    if (debouncedSearch.length >= 3) {
+      fetchColleges(debouncedSearch);
+    } else if (debouncedSearch.length === 0) {
+      fetchColleges(); // Reset to default when search is cleared
+    }
+  }, [debouncedSearch, search, fetchColleges]);
+
+  // Filter and sort colleges (client-side filtering for region/type)
   const filtered = colleges.filter(c => {
-    const s = search.toLowerCase();
-    const matchS = c.name.toLowerCase().includes(s) || 
-                   c.city.toLowerCase().includes(s) || 
-                   c.state.toLowerCase().includes(s);
     const matchRegion = region === "All Regions" || c.region === region;
     const matchType = type === "All Types" || 
                       (type === "Public" && c.ownership === "Public") ||
                       (type === "Private" && c.ownership.includes("Private"));
-    return matchS && matchRegion && matchType;
+    return matchRegion && matchType;
   }).sort((a, b) => {
     if (sortBy === "name") return a.name.localeCompare(b.name);
     if (sortBy === "admRate") return (a.admissionRate || 1) - (b.admissionRate || 1);
@@ -427,7 +437,7 @@ useEffect(() => {
     return <div className="error-box">
       <div className="icon">⚠️</div>
       <p>Error loading data: {error}</p>
-      <button onClick={fetchColleges}>Retry</button>
+      <button onClick={() => fetchColleges()}>Retry</button>
     </div>;
   }
 
@@ -444,20 +454,24 @@ useEffect(() => {
         <div className="info-banner">
           <p>
             <span className="api-status"></span>
-            <strong>Live Data:</strong> All information is fetched directly from the College Scorecard API, 
-            which aggregates data from IPEDS and other federal sources. Showing {colleges.length} institutions.
+            <strong>Live Data:</strong> Type 3+ characters to search. Results update automatically with 500ms debounce.
           </p>
         </div>
         
         <div className="search-wrap">
           <span className="icon">⌕</span>
           <input 
-            ref={ref} 
+            ref={searchRef} 
             type="text" 
-            placeholder="Search by school name, city, or state…" 
+            placeholder="Search by school name (e.g., Harvard, MIT, Stanford)..." 
             value={search} 
             onChange={e => setSearch(e.target.value)}
           />
+          {searching && (
+            <div className="searching">
+              <div className="mini-spinner"></div>
+            </div>
+          )}
         </div>
         
         <div className="filters">
@@ -487,7 +501,8 @@ useEffect(() => {
         </div>
         
         <div className="result-count">
-          Showing <strong>{filtered.length}</strong> of {colleges.length} colleges
+          Showing <strong>{filtered.length}</strong> colleges
+          {search && search.length >= 3 && <span> matching "{search}"</span>}
         </div>
       </div>
     </div>
@@ -547,7 +562,11 @@ useEffect(() => {
       {filtered.length === 0 && (
         <div className="empty">
           <div className="icon2">🎓</div>
-          <p>No colleges match your search. Try adjusting your filters.</p>
+          <p>
+            {search && search.length < 3 
+              ? "Type at least 3 characters to search" 
+              : "No colleges found. Try a different search."}
+          </p>
         </div>
       )}
     </div>
@@ -555,7 +574,7 @@ useEffect(() => {
     {sel && <Modal college={sel} onClose={() => setSel(null)} />}
     
     <div className="footer">
-      Data from College Scorecard API (IPEDS/Federal sources) · Last updated: {new Date().toLocaleDateString()}
+      Data from College Scorecard API (IPEDS/Federal sources) · Debounced search (500ms)
     </div>
   </>;
 }
@@ -563,5 +582,4 @@ useEffect(() => {
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
 </script>
 </body>
-
 </html>
